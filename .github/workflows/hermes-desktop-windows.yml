@@ -1,0 +1,103 @@
+# Compiles Hermes Desktop (Windows portable) from the Nous upstream and
+# publishes it. Each run:
+#   1. Checks out the latest NousResearch/hermes-agent@main (always current,
+#      no fork syncing needed).
+#   2. Builds ONLY the GUI as a "lite client" (no local agent).
+#   3. Uploads an Actions artifact AND publishes a versioned GitHub Release.
+#
+# TRIGGERS:
+#   - manual      (Actions > "Hermes Desktop Windows (portable)" > Run workflow)
+#   - weekly      (cron) — automatic rebuild with the latest version
+#   - push of tag "v*"
+#
+# Releases are created on the repo where this workflow runs.
+
+name: Hermes Desktop Windows (portable)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 0'   # every Sunday 06:00 UTC
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write          # needed to publish the GitHub Release
+  actions: read
+
+concurrency:
+  group: hermes-desktop-win
+  cancel-in-progress: true
+
+jobs:
+  build-desktop-win:
+    name: Build Hermes Desktop (win x64)
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      # ── Checkout the NOUS upstream, not a fork ───────────────────────
+      # The compiled code is the latest Hermes, so every release is current.
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: main
+
+      # ── Node (only to compile in CI; the end-user client never uses it)
+      # Same line as the official Nous CI (node 26 + npm 12).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Align npm to line 12 (same as official CI)
+        run: |
+          npm --version | Select-String '^12\.' -Quiet
+          if (-not $LASTEXITCODE) { npm i -g npm@12 }
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      # ── Build the desktop app (portable GUI, no agent) ───────────────
+      - name: Build desktop app (pack)
+        working-directory: apps/desktop
+        run: npm run pack
+
+      # ── Zip the portable app ─────────────────────────────────────────
+      - name: Zip portable app
+        id: zip
+        working-directory: apps/desktop/release
+        run: |
+          Compress-Archive -Path win-unpacked -DestinationPath Hermes-desktop-portable-win-x64.zip -Force
+
+      # ── Actions artifact (quick download, 30-day retention) ──────────
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-desktop-portable-win-x64
+          path: apps/desktop/release/Hermes-desktop-portable-win-x64.zip
+          retention-days: 30
+
+      # ── Versioned GitHub Release (stable, no-expiry download) ────────
+      # Only on scheduled/manual runs (not tag pushes, which carry their own
+      # release).
+      - name: Publish GitHub Release
+        if: github.event_name != 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: rubengmez/hermes-desktop-portable
+          name: "Hermes Desktop portable - win-x64 (build ${{ github.run_number }})"
+          tag_name: "desktop-portable-${{ github.run_number }}"
+          body: |
+            Portable (lite client) build of Hermes Desktop for Windows x64.
+
+            - **Source:** NousResearch/hermes-agent@main (compiled in this run)
+            - **Run:** #${{ github.run_number }}
+            - **Trigger:** ${{ github.event.schedule != '' && 'weekly schedule' || github.event_name }}
+            - **Remote connection:** in the app, Settings → Gateways → Remote gateway, or set `HERMES_DESKTOP_REMOTE_URL`.
+            - **Unsigned:** SmartScreen may warn when running (More info → Run anyway).
+          files: apps/desktop/release/Hermes-desktop-portable-win-x64.zip
+          generate_release_notes: false
+          draft: false
+          prerelease: false
