@@ -1,0 +1,144 @@
+# Compiles Hermes Desktop (Windows portable) from the LATEST OFFICIAL RELEASE
+# of NousResearch/hermes-agent, and publishes it under the SAME tag/version as
+# the upstream release.
+#
+# Behaviour:
+#   - A daily check job asks GitHub for the latest official release tag of
+#     NousResearch/hermes-agent (e.g. v2026.8.27).
+#   - If that tag differs from the last release already published in THIS repo,
+#     a Windows build job checks out that exact release tag, compiles the desktop
+#     GUI as a lite client, and publishes a versioned Release + Actions artifact.
+#   - If the tag is unchanged, nothing is built (no wasted minutes, no junk).
+#
+# Triggers:
+#   - daily (cron)  — detects new official releases automatically
+#   - manual        — always forces a rebuild on the current latest release
+#
+# Releases are created on the repo where this workflow runs.
+
+name: Hermes Desktop Windows (portable)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '5 5 * * *'   # every day 05:05 UTC — check for a new official release
+
+permissions:
+  contents: write          # publish the GitHub Release
+
+concurrency:
+  group: hermes-desktop-win
+  cancel-in-progress: true
+
+jobs:
+  # ─── Check: latest upstream release vs what we already published ───────
+  check-release:
+    name: Check latest official release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      upstream_tag:  ${{ steps.detect.outputs.upstream_tag }}
+      upstream_name: ${{ steps.detect.outputs.upstream_name }}
+      needs_build:   ${{ steps.detect.outputs.needs_build }}
+    steps:
+      - name: Detect new upstream release
+        id: detect
+        run: |
+          set -euo pipefail
+          GH_API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          UPSTREAM_API="https://api.github.com/repos/NousResearch/hermes-agent"
+
+          # Latest official (non-prerelease) release of Hermes upstream.
+          upstream="$(
+            curl -fsSL "$UPSTREAM_API/releases/latest" \
+              -H "Accept: application/vnd.github+json" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tag_name']); print(d['name'] or d['tag_name'])"
+            )"
+          UPSTREAM_TAG="$(echo "$upstream" | sed -n 1p)"
+          UPSTREAM_NAME="$(echo "$upstream" | sed -n 2p)"
+
+          # Last release tag already published in THIS repo (suffix-stripped to
+          # wall off version collisions like upstream hotfixes on the same day).
+          # We tag our releases with the exact upstream tag, so the last release
+          # tag we published is directly comparable.
+          OURS="$(
+            curl -fsSL "$GH_API/releases?per_page=1" \
+              -H "Accept: application/vnd.github+json" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['tag_name'] if d else '')"
+            )" || OURS=""
+
+          echo "upstream_tag=$UPSTREAM_TAG"
+          echo "upstream_name=$UPSTREAM_NAME"
+          echo "ours=$OURS"
+
+          if [ -n "$UPSTREAM_TAG" ] && [ "$UPSTREAM_TAG" != "$OURS" ]; then
+            echo "needs_build=true"
+          else
+            echo "needs_build=false"
+          fi
+
+          echo "upstream_tag=$UPSTREAM_TAG"  >> "$GITHUB_OUTPUT"
+          echo "upstream_name=$UPSTREAM_NAME" >> "$GITHUB_OUTPUT"
+          echo "needs_build=$([ -n "$UPSTREAM_TAG" ] && [ "$UPSTREAM_TAG" != "$OURS" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  # ─── Build: compile the exact upstream release tag ─────────────────────
+  build-desktop-win:
+    name: Build Hermes Desktop (win x64)
+    needs: check-release
+    if: needs.check-release.outputs.needs_build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      # ── Checkout the exact official release tag of Nous ──────────────
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ needs.check-release.outputs.upstream_tag }}
+
+      # ── Node (only to compile in CI; the end-user client never uses it)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Align npm to line 12 (same as official CI)
+        run: |
+          npm --version | Select-String '^12\.' -Quiet
+          if (-not $LASTEXITCODE) { npm i -g npm@12 }
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      # ── Build the desktop app (portable GUI, no agent) ───────────────
+      - name: Build desktop app (pack)
+        working-directory: apps/desktop
+        run: npm run pack
+
+      # ── Zip the portable app ─────────────────────────────────────────
+      - name: Zip portable app
+        working-directory: apps/desktop/release
+        run: |
+          Compress-Archive -Path win-unpacked -DestinationPath Hermes-desktop-portable-win-x64.zip -Force
+
+      # ── GitHub Release, SAME tag+name as the official upstream release ──
+      # The package is only published here (no Actions artifact).
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ github.repository }}
+          # Reuse the exact upstream release tag (e.g. v2026.8.27) and title.
+          tag_name:  ${{ needs.check-release.outputs.upstream_tag }}
+          name:      ${{ needs.check-release.outputs.upstream_name }} (portable build)
+          body: |
+            Portable (lite client) desktop build of **${{ needs.check-release.outputs.upstream_tag }}**.
+
+            - **Upstream:** NousResearch/hermes-agent @ ${{ needs.check-release.outputs.upstream_tag }}
+            - **Binary corresponds to Hermes release:** ${{ needs.check-release.outputs.upstream_name }}
+            - **Built in this repo's Actions:** run #${{ github.run_number }}
+            - **Remote connection:** in the app, Settings → Gateways → Remote gateway, or set `HERMES_DESKTOP_REMOTE_URL`.
+            - **Unsigned:** SmartScreen may warn when running (More info → Run anyway).
+          files: apps/desktop/release/Hermes-desktop-portable-win-x64.zip
+          generate_release_notes: false
+          draft: false
+          prerelease: false
