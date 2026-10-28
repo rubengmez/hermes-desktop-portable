@@ -1,18 +1,20 @@
-# Compiles Hermes Desktop (Windows portable) from the LATEST OFFICIAL RELEASE
-# of NousResearch/hermes-agent, and publishes it under the SAME tag/version as
-# the upstream release.
+# Portable Windows build of Hermes Desktop, compiled from the LATEST OFFICIAL
+# RELEASE of NousResearch/hermes-agent.
 #
-# Behaviour:
-#   - A daily check job asks GitHub for the latest official release tag of
-#     NousResearch/hermes-agent (e.g. v2026.8.27).
-#   - If that tag differs from the last release already published in THIS repo,
-#     a Windows build job checks out that exact release tag, compiles the desktop
-#     GUI as a lite client, and publishes a versioned Release + Actions artifact.
-#   - If the tag is unchanged, nothing is built (no wasted minutes, no junk).
+# Contract:
+#   - One release here per upstream release. Nothing is built unless upstream
+#     publishes a version we have not published yet (same tag AND same commit).
+#     The dedupe check reads `releases/tags/<tag>` directly — never
+#     `releases?per_page=1`, which is ordered by created_at and is not "newest".
+#   - The packaged app carries the real upstream version (electron-builder
+#     extraMetadata.version), so Help → About shows e.g. 0.22.5 instead of the
+#     0.0.0 placeholder that both package.json files carry in the upstream tree.
+#   - The release body records the upstream commit, and that marker is what the
+#     next run compares against (a moved/retagged upstream tag force-rebuilds).
 #
 # Triggers:
-#   - daily (cron)  — detects new official releases automatically
-#   - manual        — always forces a rebuild on the current latest release
+#   - daily (cron): detect a new upstream release
+#   - manual: same detection, plus an optional force rebuild
 #
 # Releases are created on the repo where this workflow runs.
 
@@ -20,8 +22,13 @@ name: Hermes Desktop Windows (portable)
 
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even if this upstream version is already published here'
+        type: boolean
+        default: false
   schedule:
-    - cron: '5 5 * * *'   # every day 05:05 UTC — check for a new official release
+    - cron: '5 5 * * *'   # every day 05:05 UTC — cheap check, build only on a new version
 
 permissions:
   contents: write          # publish the GitHub Release
@@ -30,73 +37,98 @@ concurrency:
   group: hermes-desktop-win
   cancel-in-progress: true
 
+env:
+  UPSTREAM_REPO: NousResearch/hermes-agent
+
 jobs:
-  # ─── Check: latest upstream release vs what we already published ───────
+  # ─── Check: latest upstream release vs what this repo already published ──
   check-release:
     name: Check latest official release
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      upstream_tag:  ${{ steps.detect.outputs.upstream_tag }}
-      upstream_name: ${{ steps.detect.outputs.upstream_name }}
-      needs_build:   ${{ steps.detect.outputs.needs_build }}
+      tag:         ${{ steps.detect.outputs.tag }}
+      version:     ${{ steps.detect.outputs.version }}
+      name:        ${{ steps.detect.outputs.name }}
+      commit:      ${{ steps.detect.outputs.commit }}
+      published:   ${{ steps.detect.outputs.published }}
+      needs_build: ${{ steps.detect.outputs.needs_build }}
     steps:
       - name: Detect new upstream release
         id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          GH_API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
-          UPSTREAM_API="https://api.github.com/repos/NousResearch/hermes-agent"
+          api() { curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "$@"; }
 
-          # Latest official (non-prerelease) release of Hermes upstream.
-          upstream="$(
-            curl -fsSL "$UPSTREAM_API/releases/latest" \
-              -H "Accept: application/vnd.github+json" \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tag_name']); print(d['name'] or d['tag_name'])"
-            )"
-          UPSTREAM_TAG="$(echo "$upstream" | sed -n 1p)"
-          UPSTREAM_NAME="$(echo "$upstream" | sed -n 2p)"
+          # 1. Latest published (non-draft, non-prerelease) upstream release.
+          rel=$(api "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest")
+          TAG=$(jq -r '.tag_name' <<<"$rel")
+          NAME=$(jq -r '.name // .tag_name' <<<"$rel")
+          VERSION="${TAG#v}"
+          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "::error::could not read upstream release tag"; exit 1; }
 
-          # Last release tag already published in THIS repo (suffix-stripped to
-          # wall off version collisions like upstream hotfixes on the same day).
-          # We tag our releases with the exact upstream tag, so the last release
-          # tag we published is directly comparable.
-          OURS="$(
-            curl -fsSL "$GH_API/releases?per_page=1" \
-              -H "Accept: application/vnd.github+json" \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['tag_name'] if d else '')"
-            )" || OURS=""
-
-          echo "upstream_tag=$UPSTREAM_TAG"
-          echo "upstream_name=$UPSTREAM_NAME"
-          echo "ours=$OURS"
-
-          if [ -n "$UPSTREAM_TAG" ] && [ "$UPSTREAM_TAG" != "$OURS" ]; then
-            echo "needs_build=true"
-          else
-            echo "needs_build=false"
+          # 2. The exact commit that tag points at (annotated tag → deref once).
+          ref=$(api "https://api.github.com/repos/${UPSTREAM_REPO}/git/ref/tags/${TAG}")
+          sha=$(jq -r '.object.sha' <<<"$ref")
+          if [ "$(jq -r '.object.type' <<<"$ref")" = "tag" ]; then
+            sha=$(api "https://api.github.com/repos/${UPSTREAM_REPO}/git/tags/${sha}" | jq -r '.object.sha')
           fi
 
-          echo "upstream_tag=$UPSTREAM_TAG"  >> "$GITHUB_OUTPUT"
-          echo "upstream_name=$UPSTREAM_NAME" >> "$GITHUB_OUTPUT"
-          echo "needs_build=$([ -n "$UPSTREAM_TAG" ] && [ "$UPSTREAM_TAG" != "$OURS" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          # 3. Have we already published THIS tag at THIS commit, with a zip?
+          NEEDS_BUILD=true
+          PUBLISHED=''
+          if existing=$(api "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>/dev/null); then
+            PUBLISHED=$(jq -r '
+              [ .assets[] | select(.name | endswith(".zip")) | select(.size > 1000000) ] | length
+            ' <<<"$existing")
+            if [ "${PUBLISHED:-0}" -gt 0 ] \
+               && grep -q "upstream-commit: ${sha}" <<<"$(jq -r '.body // ""' <<<"$existing")"; then
+              NEEDS_BUILD=false
+            fi
+          fi
 
-  # ─── Build: compile the exact upstream release tag ─────────────────────
+          if [ "${FORCE:-false}" = "true" ]; then NEEDS_BUILD=true; fi
+
+          echo "upstream: ${TAG} (${NAME}) @ ${sha}"
+          echo "already published here: ${PUBLISHED:-0} zip asset(s) → needs_build=${NEEDS_BUILD}"
+          {
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "name=${NAME}"
+            echo "commit=${sha}"
+            echo "published=${PUBLISHED:-0}"
+            echo "needs_build=${NEEDS_BUILD}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ─── Build: compile the exact upstream release tag ───────────────────────
   build-desktop-win:
     name: Build Hermes Desktop (win x64)
     needs: check-release
     if: needs.check-release.outputs.needs_build == 'true'
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
+    env:
+      UPSTREAM_TAG: ${{ needs.check-release.outputs.tag }}
+      VERSION:      ${{ needs.check-release.outputs.version }}
+      # Recorded as displayVersion in resources/install-stamp.json: provenance
+      # only (no release feed is staged — HERMES_PAYLOAD_TAG stays unset).
+      HERMES_PAYLOAD_VERSION: ${{ needs.check-release.outputs.version }}
+      # Remote-only ("lite") client: no local agent, no self-update feed.
+      # NOTE: with the default (non-light) variant the stamp payload is
+      # "bootstrap" and the About panel prefers the *gateway* version over the
+      # build's own — that is how a brand-new download can report an old number.
+      HERMES_DESKTOP_VARIANT: light
 
     steps:
-      # ── Checkout the exact official release tag of Nous ──────────────
-      - uses: actions/checkout@v4
+      - name: Checkout upstream release tag
+        uses: actions/checkout@v4
         with:
-          repository: NousResearch/hermes-agent
-          ref: ${{ needs.check-release.outputs.upstream_tag }}
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check-release.outputs.tag }}
 
-      # ── Node (only to compile in CI; the end-user client never uses it)
       - uses: actions/setup-node@v4
         with:
           node-version: 26
@@ -110,35 +142,76 @@ jobs:
       - name: Install workspace dependencies
         run: npm ci
 
-      # ── Build the desktop app (portable GUI, no agent) ───────────────
-      - name: Build desktop app (pack)
+      # ── Build the desktop GUI (portable, no agent payload) ───────────────
+      - name: Build desktop app (vite + electron)
         working-directory: apps/desktop
-        run: npm run pack
+        run: npm run build
 
-      # ── Zip the portable app ─────────────────────────────────────────
+      - name: Package portable app
+        working-directory: apps/desktop
+        # extraMetadata.version is the sanctioned override (upstream's own
+        # release pipeline passes the same flag); package.json in the upstream
+        # tree is a 0.0.0 placeholder, which is why an unstamped build reports
+        # 0.0.0 in Help → About.
+        run: npm run builder -- --dir --publish never "-c.extraMetadata.version=$env:VERSION"
+
+      - name: Assert packaged version
+        working-directory: apps/desktop/release/win-unpacked
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem *.exe | Sort-Object Length -Descending | Select-Object -First 1
+          $v = $exe.VersionInfo
+          "packaged exe: $($exe.Name) FileVersion=$($v.FileVersion) ProductVersion=$($v.ProductVersion)"
+          if ($v.FileVersion -notlike "$env:VERSION*") {
+            throw "packaged version '$($v.FileVersion)' does not match upstream '$env:VERSION'"
+          }
+
       - name: Zip portable app
         working-directory: apps/desktop/release
+        shell: pwsh
         run: |
-          Compress-Archive -Path win-unpacked -DestinationPath Hermes-desktop-portable-win-x64.zip -Force
+          $zip = "Hermes-desktop-portable-win-x64-$env:VERSION.zip"
+          Compress-Archive -Path win-unpacked -DestinationPath $zip -Force
+          "zip: $zip ($([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB)"
+          "ASSET_NAME=$zip" >> $env:GITHUB_ENV
 
-      # ── GitHub Release, SAME tag+name as the official upstream release ──
-      # The package is only published here (no Actions artifact).
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           repository: ${{ github.repository }}
-          # Reuse the exact upstream release tag (e.g. v2026.8.27) and title.
-          tag_name:  ${{ needs.check-release.outputs.upstream_tag }}
-          name:      ${{ needs.check-release.outputs.upstream_name }} (portable build)
-          body: |
-            Portable (lite client) desktop build of **${{ needs.check-release.outputs.upstream_tag }}**.
-
-            - **Upstream:** NousResearch/hermes-agent @ ${{ needs.check-release.outputs.upstream_tag }}
-            - **Binary corresponds to Hermes release:** ${{ needs.check-release.outputs.upstream_name }}
-            - **Built in this repo's Actions:** run #${{ github.run_number }}
-            - **Remote connection:** in the app, Settings → Gateways → Remote gateway, or set `HERMES_DESKTOP_REMOTE_URL`.
-            - **Unsigned:** SmartScreen may warn when running (More info → Run anyway).
-          files: apps/desktop/release/Hermes-desktop-portable-win-x64.zip
+          tag_name: ${{ needs.check-release.outputs.tag }}
+          name: ${{ needs.check-release.outputs.name }} (portable build)
+          overwrite_files: true
           generate_release_notes: false
           draft: false
           prerelease: false
+          body: |
+            Portable Windows build of **Hermes Agent ${{ needs.check-release.outputs.version }}**,
+            compiled from upstream `${{ env.UPSTREAM_REPO }}` @ `${{ needs.check-release.outputs.tag }}`.
+
+            <!-- upstream-commit: ${{ needs.check-release.outputs.commit }} -->
+
+            | | |
+            |---|---|
+            | Upstream version | `${{ needs.check-release.outputs.version }}` |
+            | Upstream commit | `${{ needs.check-release.outputs.commit }}` |
+            | Variant | lite client (`HERMES_DESKTOP_VARIANT=light`) — GUI only, no local agent |
+            | Asset | `${{ env.ASSET_NAME }}` |
+            | Built in Actions | run #${{ github.run_number }} |
+
+            **What you get:** extract the zip anywhere and run the `Hermes*.exe` inside. No
+            installer, no local agent. Point it at a remote backend with
+            **Settings → Gateways → Remote gateway** (or `HERMES_DESKTOP_REMOTE_URL`).
+
+            **Update check:** the app shows its own version in **Help → About** — it must match
+            `${{ needs.check-release.outputs.version }}`. If it shows anything else, you are
+            running an older download.
+
+            **Unsigned:** SmartScreen may warn on first run (More info → Run anyway).
+            Not affiliated with Nous Research; see the repo README.
+          files: apps/desktop/release/${{ env.ASSET_NAME }}
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          "Built $env:UPSTREAM_TAG (version $env:VERSION) → $env:ASSET_NAME" >> $env:GITHUB_STEP_SUMMARY
